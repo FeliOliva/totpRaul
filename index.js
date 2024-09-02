@@ -3,90 +3,100 @@ import speakeasy from "speakeasy";
 import qrcode from "qrcode";
 import qrcodeTerminal from "qrcode-terminal";
 import pool from "./db.js";
+import cors from "cors";
 
 const app = express();
 app.use(express.json());
+app.use(cors());
 
 let secret;
 
 app.post("/generate-qr", async (req, res) => {
-  const { emailuser, appname } = req.body;
-
-  if (!emailuser || !appname) {
-    return res
-      .status(400)
-      .json({ error: "Email y nombre de la aplicación son requeridos" });
-  }
-
-  const secret = speakeasy.generateSecret({ length: 20 });
-  console.log("secret: ", secret);
-
-  const otpauthUrl = speakeasy.otpauthURL({
-    secret: secret.base32,
-    label: `${appname}:${emailuser}`,
-    issuer: "empresa",
-    encoding: "base32",
-  });
-  console.log("otpauthUrl: ", otpauthUrl);
-
   try {
-    // Verifica si ya existe un registro con el mismo email y appname
-    const existingUser = await pool.query(
-      "SELECT * FROM users WHERE emailuser = $1 AND appname = $2",
-      [emailuser, appname]
-    );
-
-    if (existingUser.rows.length > 0) {
-      // Actualiza el secret existente y el updatedAt
-      await pool.query(
-        "UPDATE users SET secret = $1, updatedAt = NOW() WHERE emailuser = $2 AND appname = $3",
-        [secret.base32, emailuser, appname]
-      );
-    } else {
-      // Inserta un nuevo registro
-      await pool.query(
-        "INSERT INTO users (secret, emailuser, appname, createdAt, updatedAt) VALUES ($1, $2, $3, NOW(), NOW())",
-        [secret.base32, emailuser, appname]
-      );
+    const { emailuser, appname } = req.body;
+    if (!emailuser || !appname) {
+      return res
+        .status(400)
+        .json({ error: "Email y nombre de la aplicación son requeridos" });
     }
 
-    // Genera el QR en la terminal
-    qrcodeTerminal.generate(otpauthUrl, { small: true }, function (qrcode) {
-      console.log("QR");
-      console.log(qrcode);
+    const secret = speakeasy.generateSecret({ length: 20 });
+    const otpauthUrl = speakeasy.otpauthURL({
+      secret: secret.base32,
+      label: `${appname}:${emailuser}`,
+      issuer: "empresa",
+      encoding: "base32",
     });
 
-    // Genera el QR en formato data URL
-    qrcode.toDataURL(otpauthUrl, (err, data_url) => {
-      if (err) {
-        res.status(500).json({ error: "Error generando QR" });
+    const client = await pool.connect(); // Conectar al pool
+    try {
+      const existingUser = await client.query(
+        "SELECT * FROM users WHERE emailuser = $1 AND appname = $2",
+        [emailuser, appname]
+      );
+
+      if (existingUser.rows.length > 0) {
+        await client.query(
+          "UPDATE users SET secret = $1 WHERE emailuser = $2 AND appname = $3",
+          [secret.base32, emailuser, appname]
+        );
       } else {
-        res.json({ secret: secret.base32, qrcode: data_url });
+        await client.query(
+          "INSERT INTO users (secret, emailuser, appname, create_time) VALUES ($1, $2, $3, NOW())",
+          [secret.base32, emailuser, appname]
+        );
       }
-    });
+
+      qrcodeTerminal.generate(otpauthUrl, { small: true }, function (qrcode) {
+        console.log("QR");
+        console.log(qrcode);
+      });
+
+      qrcode.toDataURL(otpauthUrl, (err, data_url) => {
+        if (err) {
+          res.status(500).json({ error: "Error generando QR" });
+        } else {
+          res.json({ secret: secret.base32, qrcode: data_url });
+        }
+      });
+    } finally {
+      client.release(); // Asegúrate de liberar el cliente de nuevo al pool
+    }
   } catch (error) {
     console.error("Error al guardar en la base de datos:", error);
     res.status(500).json({ error: "Error al guardar en la base de datos" });
   }
 });
 
-app.post("/verify-totp", (req, res) => {
-  const { token } = req.body;
+app.post("/verify-totp", async (req, res) => {
+  const { token, emailuser, appname } = req.body;
 
-  if (!secret) {
-    return res.status(400).send("Secret no definido. Generar QR primero.");
-  }
+  try {
+    const result = await pool.query(
+      "SELECT secret FROM users WHERE emailuser = $1 AND appname = $2",
+      [emailuser, appname]
+    );
 
-  const verified = speakeasy.totp.verify({
-    secret: secret.base32,
-    encoding: "base32",
-    token: token,
-  });
+    if (result.rows.length === 0) {
+      return res.status(400).send("Usuario o aplicación no encontrados.");
+    }
 
-  if (verified) {
-    res.send("🤙🏼🤙🏼🤙🏼🤙🏼");
-  } else {
-    res.status(400).send("👎🏼👎🏼👎🏼👎🏼");
+    const userSecret = result.rows[0].secret;
+
+    const verified = speakeasy.totp.verify({
+      secret: userSecret,
+      encoding: "base32",
+      token: token,
+    });
+
+    if (verified) {
+      res.send("🤙🏼🤙🏼🤙🏼🤙🏼");
+    } else {
+      res.status(400).send("👎🏼👎🏼👎🏼👎🏼");
+    }
+  } catch (error) {
+    console.error("Error al verificar el TOTP:", error);
+    res.status(500).json({ error: "Error al verificar el TOTP" });
   }
 });
 
